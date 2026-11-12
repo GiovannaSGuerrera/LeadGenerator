@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Lead, Mode } from "../lib/types";
+import LeadReviewPanel from "./lead-review-panel";
 
 type District = { name: string; total: number };
 
@@ -24,6 +25,8 @@ export default function Dashboard() {
   const [sourceMode, setSourceMode] = useState("empty");
   const [total, setTotal] = useState(0);
   const [warning, setWarning] = useState("");
+  const [includeExcluded, setIncludeExcluded] = useState(false);
+  const [queue, setQueue] = useState("all");
   const [loading, setLoading] = useState(false);
   const requestId = useRef(0);
 
@@ -36,7 +39,7 @@ export default function Dashboard() {
   const isBusinessMode = mode === "business_without_website";
   const hasRealData = sourceMode === "foursquare" || sourceMode === "overture" || sourceMode === "public";
 
-  async function search(nextNeighborhood = neighborhood, nextMode = mode, nextQuery = query, nextPage = 1, nextCategory = category, nextMarket = market) {
+  async function search(nextNeighborhood = neighborhood, nextMode = mode, nextQuery = query, nextPage = 1, nextCategory = category, nextMarket = market, nextIncludeExcluded = includeExcluded, nextQueue = queue) {
     const currentRequest = ++requestId.current;
     setLoading(true);
     try {
@@ -46,6 +49,8 @@ export default function Dashboard() {
         neighborhood: nextNeighborhood === "Todos" ? "" : nextNeighborhood,
         category: nextCategory,
         market: nextMarket,
+        includeExcluded: nextIncludeExcluded ? "1" : "0",
+        queue: nextQueue,
         page: String(nextPage)
       });
       const response = await fetch(`/api/leads?${params}`, { cache: "no-store" });
@@ -79,6 +84,8 @@ export default function Dashboard() {
     setNeighborhood("Todos");
     setCategory("");
     setMarket("br_or_eur");
+    setIncludeExcluded(false);
+    setQueue("all");
     search("Todos", nextMode, "", 1, "", "br_or_eur");
   }
 
@@ -87,12 +94,14 @@ export default function Dashboard() {
     setNeighborhood("Todos");
     setCategory("");
     setMarket("br_or_eur");
-    search("Todos", mode, "", 1, "", "br_or_eur");
+    setIncludeExcluded(false);
+    setQueue("all");
+    search("Todos", mode, "", 1, "", "br_or_eur", false, "all");
   }
 
   useEffect(() => { search("Todos", "business_without_website"); }, []);
   useEffect(() => {
-    const refresh = () => search(neighborhood, mode, query, page, category, market);
+    const refresh = () => search(neighborhood, mode, query, page, category, market, includeExcluded, queue);
     const refreshOnVisibility = () => { if (document.visibilityState === "visible") refresh(); };
     const timer = window.setInterval(refresh, 15 * 60 * 1000);
     window.addEventListener("focus", refresh);
@@ -102,7 +111,7 @@ export default function Dashboard() {
       window.removeEventListener("focus", refresh);
       document.removeEventListener("visibilitychange", refreshOnVisibility);
     };
-  }, [neighborhood, mode, query, page, category, market]);
+  }, [neighborhood, mode, query, page, category, market, includeExcluded, queue]);
 
   return (
     <div className="app-frame">
@@ -174,6 +183,8 @@ export default function Dashboard() {
                 <button type="submit" className="search-button" disabled={loading}>{loading ? "Buscando..." : "Pesquisar"}<span aria-hidden="true">→</span></button>
               </div>
               <button type="button" className="clear-button" onClick={clearFilters}>Limpar filtros</button>
+              <label className="field queue-field"><span>Minha fila</span><select value={queue} onChange={(event) => { setQueue(event.target.value); search(neighborhood, mode, query, 1, category, market, includeExcluded, event.target.value); }}><option value="all">Todas as oportunidades</option><option value="to_contact">Para contatar</option><option value="due">Ação para hoje ou atrasada</option><option value="in_progress">Em andamento</option></select></label>
+              <label className="include-excluded"><input type="checkbox" checked={includeExcluded} onChange={(event) => { setIncludeExcluded(event.target.checked); search(neighborhood, mode, query, 1, category, market, event.target.checked); }} /> Incluir resultados descartados, redes e telefones fora de SP</label>
             </form>}
 
             {!isBusinessMode && <form className="filter-panel" onSubmit={(event) => { event.preventDefault(); search("Todos", mode, query, 1, category); }}>
@@ -195,17 +206,18 @@ export default function Dashboard() {
             </div>
 
             <div className="result-list">
-              {leads.length === 0 && <div className="empty-state"><span aria-hidden="true">◎</span><strong>{loading ? "Consultando a base..." : sourceMode === "empty" && isBusinessMode ? "Aguardando empresas com telefone" : "Nenhum pedido neste recorte agora"}</strong><p>{loading ? "Aguarde um momento." : sourceMode === "empty" && isBusinessMode ? "A exportação com o campo de telefone precisa ser concluída." : market === "br" ? "O feed não trouxe projetos com português e sinal de Brasil/BRL nesta atualização. Tente novamente depois." : "Tente outro filtro ou confira depois da próxima atualização."}</p></div>}
+              {leads.length === 0 && <div className="empty-state"><span aria-hidden="true">◎</span><strong>{loading ? "Consultando a base..." : isBusinessMode ? "Nenhuma empresa neste recorte" : "Nenhum pedido neste recorte agora"}</strong><p>{loading ? "Aguarde um momento." : isBusinessMode ? "Ajuste os filtros ou inclua os resultados descartados para revisar a base." : market === "br" ? "O feed não trouxe projetos com português e sinal de Brasil/BRL nesta atualização. Tente novamente depois." : "Tente outro filtro ou confira depois da próxima atualização."}</p></div>}
               {leads.map((lead, index) => {
                 const categoryName = (lead.category.split(" > ").at(-1) || lead.category).replaceAll("_", " ");
                 return <article className="result-card" key={lead.id}>
                   <div className="result-number">{String((page - 1) * pageSize + index + 1).padStart(2, "0")}</div>
                   <div className="result-body">
-                    <div className="result-title-row"><h4>{lead.name}</h4><span className="website-chip">{isBusinessMode ? "Website não informado" : lead.source === "PNCP" ? "Prazo aberto" : "Projeto publicado"}</span></div>
+                    <div className="result-title-row"><h4>{lead.name}</h4><span className="website-chip">{isBusinessMode ? lead.workflow?.websiteReview === "no_site" ? "Site não encontrado por você" : lead.workflow?.websiteReview === "has_site" ? "Site encontrado" : "Website não informado na fonte" : lead.source === "PNCP" ? "Prazo aberto" : "Projeto publicado"}</span>{isBusinessMode && lead.workflow?.placeStatus === "confirmed" && lead.workflow.websiteReview === "no_site" && <span className="priority-chip">Prioridade alta · ficha e site conferidos</span>}</div>
                     <div className="result-category">{categoryName}</div>
                     <div className="result-meta"><span><b aria-hidden="true">⌖</b> {isBusinessMode || lead.source === "PNCP" ? `${lead.city}, ${lead.neighborhood}` : "Freelancer.com · online"}</span>{lead.address && <span><b aria-hidden="true">↳</b> {lead.address}</span>}</div>
                     {!isBusinessMode && <><p className="request-description">{lead.description}</p><div className="request-facts">{lead.source === "PNCP" && <span>Órgão: {lead.organization}</span>}{lead.budgetText && <span>Orçamento: {lead.budgetText}</span>}{lead.budget && <span>Estimativa: {lead.budget.toLocaleString("pt-BR", { style: "currency", currency: "BRL" })}</span>}{lead.deadlineAt && <span>Encerra: {dateFormat.format(new Date(lead.deadlineAt))}</span>}</div></>}
                     {lead.phone && <div className="result-phone"><span aria-hidden="true">☎</span> <a href={`tel:${lead.phone.replace(/\D/g, "")}`}>{lead.phone}</a><small>Telefone informado na fonte</small></div>}
+                    {isBusinessMode && <LeadReviewPanel lead={lead} onSaved={() => search(neighborhood, mode, query, page, category, market, includeExcluded)} />}
                   </div>
                   <div className="result-actions">
                     {lead.mapUrl && <a href={lead.mapUrl} target="_blank" rel="noopener noreferrer" className="map-link">Ver empresa no Google Maps <span aria-hidden="true">↗</span></a>}

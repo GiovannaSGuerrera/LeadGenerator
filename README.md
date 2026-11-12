@@ -79,6 +79,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-daily.ps
 
 O botão Pesquisar consulta imediatamente o banco local.
 
+## Qualificação e acompanhamento dos leads
+
+Na modalidade **Site não informado**, o painel mostra por padrão empresas com telefone de São Paulo (DDD 11). Ele retira da fila inicial categorias de centros comerciais e órgãos públicos, nomes de serviços públicos e algumas redes conhecidas. O filtro **Incluir resultados descartados, redes e telefones fora de SP** permite auditar a base inteira. O filtro é conservador: uma ficha omitida pode ser revista ao ativar essa opção.
+
+Cada cartão tem **Revisar e acompanhar**. Abra a ficha no Google Maps e a busca **Verificar site**, então registre se a empresa foi encontrada, se você encontrou um site, o andamento do contato, a data do último contato, a próxima ação e anotações. O filtro **Minha fila** encontra empresas para contatar, contatos em andamento e ações previstas até hoje. Essas decisões são manuais; o app não afirma ter conferido automaticamente o Google Maps nem a web. Empresas marcadas como **site encontrado**, **empresa não encontrada**, **cliente fechado** ou **sem interesse** saem da fila padrão e continuam acessíveis pelo filtro de resultados descartados.
+
+A lista coloca primeiro fichas que você confirmou no mapa e para as quais não encontrou site; depois aparecem os registros ainda pendentes de conferência. Os dados de revisão ficam na tabela local `lead_workflow`, separada dos registros importados. Atualizações da Overture e da Foursquare mantêm as suas anotações e estados para o mesmo ID da fonte. A qualificação e o acompanhamento estão disponíveis para empresas; **Pedidos públicos** permanece com seus filtros próprios.
+
 Para executar manualmente outra atualização:
 
 ```powershell

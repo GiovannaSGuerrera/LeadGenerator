@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDatabase } from "../../../lib/db";
-import { Lead } from "../../../lib/types";
+import { Lead, LeadWorkflow } from "../../../lib/types";
+import { businessEligibilitySql, emptyWorkflow, prioritySql } from "../../../lib/lead-qualification";
 import districtNames from "../../../../geo/sp-district-names.json";
 import fs from "node:fs";
 import path from "node:path";
@@ -13,9 +14,8 @@ const businessCategoryPrefixes = [
   "Sports and Recreation > Gym and Studio", "Sports and Recreation > Martial Arts Dojo", "Sports and Recreation > Gymnastics > Gymnastics Center", "Sports and Recreation > Sports Club",
   "Arts and Entertainment > Art Gallery", "Arts and Entertainment > Night Club", "Arts and Entertainment > Comedy Club", "Arts and Entertainment > Arcade", "Arts and Entertainment > Movie Theater", "Arts and Entertainment > Performing Arts Venue"
 ];
-const businessClause = `(${businessCategoryPrefixes.map(() => "category LIKE ?").join(" OR ")})`;
+const businessClause = `(${businessCategoryPrefixes.map(() => "p.category LIKE ?").join(" OR ")})`;
 const businessValues = businessCategoryPrefixes.map((prefix) => `${prefix}%`);
-const eligibleClause = `${businessClause} AND phone IS NOT NULL AND trim(phone) <> ''`;
 
 function readStatus(name: string) {
   try {
@@ -68,41 +68,52 @@ export async function GET(request: NextRequest) {
   const query = (params.get("query") ?? "").trim().slice(0, 100);
   const neighborhood = (params.get("neighborhood") ?? "").trim().slice(0, 80);
   const category = (params.get("category") ?? "").trim().slice(0, 80);
+  const includeExcluded = params.get("includeExcluded") === "1";
+  const queue = params.get("queue") ?? "all";
   const page = Math.max(1, Math.min(100000, Number.parseInt(params.get("page") ?? "1", 10) || 1));
   const db = getDatabase();
   const overtureCount = (db.prepare("SELECT COUNT(*) AS total FROM overture_places").get() as { total: number }).total;
   const useOverture = overtureCount > 0;
+  const source = useOverture ? "overture" : "fsq";
   const table = useOverture ? "overture_places" : "fsq_places";
-  const baseClause = useOverture ? "phone IS NOT NULL AND trim(phone) <> ''" : eligibleClause;
-  const baseValues = useOverture ? [] : businessValues;
+  const from = `${table} p LEFT JOIN lead_workflow w ON w.source = '${source}' AND w.source_id = ${useOverture ? "p.id" : "p.fsq_place_id"}`;
+  const eligibility = businessEligibilitySql(source, includeExcluded);
+  const baseClause = [useOverture ? "1 = 1" : businessClause, eligibility.clause].join(" AND ");
+  const baseValues = [...(useOverture ? [] : businessValues), ...eligibility.values];
   const status = readStatus(useOverture ? "overture-refresh-status.json" : "refresh-status.json");
   const refreshError = status?.state === "error" ? status.message ?? "A atualização falhou." : "";
-  const count = (db.prepare(`SELECT COUNT(*) AS total FROM ${table} WHERE ${baseClause}`).get(...baseValues) as { total: number }).total;
-  const districtCounts = new Map((db.prepare(`SELECT neighborhood, COUNT(*) AS total FROM ${table} WHERE ${baseClause} GROUP BY neighborhood`).all(...baseValues) as Array<{ neighborhood: string; total: number }>).map((row) => [row.neighborhood, row.total]));
+  const count = (db.prepare(`SELECT COUNT(*) AS total FROM ${from} WHERE ${baseClause}`).get(...baseValues) as { total: number }).total;
+  const districtCounts = new Map((db.prepare(`SELECT p.neighborhood AS neighborhood, COUNT(*) AS total FROM ${from} WHERE ${baseClause} GROUP BY p.neighborhood`).all(...baseValues) as Array<{ neighborhood: string; total: number }>).map((row) => [row.neighborhood, row.total]));
   const districts = districtNames.map((name) => ({ name, total: districtCounts.get(name) ?? 0 }));
   if (!count) {
     const overtureStatus = readStatus("overture-refresh-status.json");
-    const warning = overtureStatus?.state === "error"
+    const rawCount = (db.prepare(`SELECT COUNT(*) AS total FROM ${table}`).get() as { total: number }).total;
+    const warning = rawCount ? "Os filtros de qualificação ocultaram todos os resultados. Marque ‘Incluir resultados descartados’ para revisar a base completa." : overtureStatus?.state === "error"
       ? `A fonte aberta Overture ainda não foi carregada: ${overtureStatus.message}`
       : "Aguardando a primeira importação de empresas com telefone da Overture Maps.";
-    return NextResponse.json({ leads: [], sourceMode: "empty", total: 0, districts, warning }, { headers: { "Cache-Control": "no-store" } });
+    return NextResponse.json({ leads: [], sourceMode: rawCount ? (useOverture ? "overture" : "foursquare") : "empty", total: 0, districts, warning }, { headers: { "Cache-Control": "no-store" } });
   }
   const clauses = [baseClause];
   const values: string[] = [...baseValues];
-  if (query) { clauses.push("(name LIKE ? OR address LIKE ?)"); values.push(`%${query}%`, `%${query}%`); }
-  if (neighborhood) { clauses.push("neighborhood = ?"); values.push(neighborhood); }
-  if (category) { clauses.push("category LIKE ?"); values.push(`%${category}%`); }
+  if (query) { clauses.push("(p.name LIKE ? OR p.address LIKE ?)"); values.push(`%${query}%`, `%${query}%`); }
+  if (neighborhood) { clauses.push("p.neighborhood = ?"); values.push(neighborhood); }
+  if (category) { clauses.push("p.category LIKE ?"); values.push(`%${category}%`); }
+  if (queue === "to_contact") clauses.push("w.contact_status = 'to_contact'");
+  if (queue === "in_progress") clauses.push("w.contact_status IN ('contacted', 'replied', 'proposal')");
+  if (queue === "due") clauses.push("w.next_action_at IS NOT NULL AND w.next_action_at <= date('now', 'localtime')");
   const where = clauses.join(" AND ");
-  const total = (db.prepare(`SELECT COUNT(*) AS total FROM ${table} WHERE ${where}`).get(...values) as { total: number }).total;
-  const order = useOverture ? "confidence DESC, name" : "COALESCE(date_refreshed, '') DESC, name";
-  const rows = db.prepare(`SELECT * FROM ${table} WHERE ${where} ORDER BY ${order} LIMIT 200 OFFSET ?`).all(...values, (page - 1) * 200) as Array<Record<string, string | number | null>>;
+  const total = (db.prepare(`SELECT COUNT(*) AS total FROM ${from} WHERE ${where}`).get(...values) as { total: number }).total;
+  const sourceOrder = useOverture ? "p.confidence DESC" : "COALESCE(p.date_refreshed, '') DESC";
+  const rows = db.prepare(`SELECT p.*, w.place_status, w.website_review, w.contact_status, w.last_contact_at, w.next_action_at, w.notes, ${prioritySql} AS priority FROM ${from} WHERE ${where} ORDER BY priority DESC, ${sourceOrder}, p.name LIMIT 200 OFFSET ?`).all(...values, (page - 1) * 200) as Array<Record<string, string | number | null>>;
   const lastUpdatedAt = (db.prepare(`SELECT MAX(imported_at) AS value FROM ${table}`).get() as { value: string | null }).value;
   const leads: Lead[] = rows.map((row) => {
     const sourceUrl = useOverture ? "https://explore.overturemaps.org/" : `https://foursquare.com/placemakers/review-place/${encodeURIComponent(String(row.fsq_place_id))}`;
     const placeQuery = [String(row.name), row.address ? String(row.address) : String(row.neighborhood), "São Paulo, SP"].join(", ");
     const mapUrl = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(placeQuery)}`;
-    if (useOverture) return { id: `overture-${row.id}`, mode: "business_without_website", name: String(row.name), category: String(row.category), neighborhood: String(row.neighborhood), city: String(row.locality), address: row.address ? String(row.address) : undefined, phone: String(row.phone), mapUrl, websiteStatus: "absent_in_source", source: "Overture Maps", sourceUrl, sourceRecordId: String(row.id), collectedAt: String(row.imported_at), confidence: Number(row.confidence) >= 0.9 ? "high" : "medium", reviewStatus: row.review_status as Lead["reviewStatus"], isMock: false, evidence: [{ sourceUrl, collectedAt: String(row.imported_at), criterion: `Overture ${row.release}: phones preenchido, websites vazio, ID ${row.id}` }], criteria: ["coordenadas no distrito oficial de São Paulo", "country BR", "website não informado", "telefone informado", "pontuação Overture >= 0,8"], note: "O telefone e a ausência de website vêm da Overture. Confira o número, a empresa e a existência de site antes de entrar em contato." };
-    return { id: `fsq-${row.fsq_place_id}`, mode: "business_without_website", name: String(row.name), category: String(row.category), neighborhood: String(row.neighborhood), city: String(row.locality), address: row.address ? String(row.address) : undefined, phone: String(row.phone), mapUrl, websiteStatus: "absent_in_source", source: "Foursquare OS Places", sourceUrl, collectedAt: String(row.imported_at), confidence: "low", reviewStatus: row.review_status as Lead["reviewStatus"], isMock: false, evidence: [{ sourceUrl, collectedAt: String(row.imported_at), criterion: "Campos website vazio e tel preenchido na exportação FSQ OS Places" }], criteria: ["coordenadas no distrito oficial de São Paulo", "country BR", "campo website vazio", "telefone informado na fonte", "sem sinal de fechamento ou flag crítica"], note: "O website não foi informado e o telefone consta na fonte. Confira manualmente se o negócio existe, se o número está atualizado e se já possui site." };
+    const workflow: LeadWorkflow = { placeStatus: (row.place_status ?? emptyWorkflow.placeStatus) as LeadWorkflow["placeStatus"], websiteReview: (row.website_review ?? emptyWorkflow.websiteReview) as LeadWorkflow["websiteReview"], contactStatus: (row.contact_status ?? emptyWorkflow.contactStatus) as LeadWorkflow["contactStatus"], lastContactAt: String(row.last_contact_at ?? ""), nextActionAt: String(row.next_action_at ?? ""), notes: String(row.notes ?? "") };
+    const shared = { workflow, priority: Number(row.priority) };
+    if (useOverture) return { id: `overture-${row.id}`, mode: "business_without_website", name: String(row.name), category: String(row.category), neighborhood: String(row.neighborhood), city: String(row.locality), address: row.address ? String(row.address) : undefined, phone: String(row.phone), mapUrl, websiteStatus: "absent_in_source", source: "Overture Maps", sourceUrl, sourceRecordId: String(row.id), collectedAt: String(row.imported_at), confidence: Number(row.confidence) >= 0.9 ? "high" : "medium", reviewStatus: row.review_status as Lead["reviewStatus"], isMock: false, evidence: [{ sourceUrl, collectedAt: String(row.imported_at), criterion: `Overture ${row.release}: phones preenchido, websites vazio, ID ${row.id}` }], criteria: ["coordenadas no distrito oficial de São Paulo", "country BR", "website não informado", "telefone informado", "pontuação Overture >= 0,8"], note: "O telefone e a ausência de website vêm da Overture. Confira o número, a empresa e a existência de site antes de entrar em contato.", ...shared };
+    return { id: `fsq-${row.fsq_place_id}`, mode: "business_without_website", name: String(row.name), category: String(row.category), neighborhood: String(row.neighborhood), city: String(row.locality), address: row.address ? String(row.address) : undefined, phone: String(row.phone), mapUrl, websiteStatus: "absent_in_source", source: "Foursquare OS Places", sourceUrl, sourceRecordId: String(row.fsq_place_id), collectedAt: String(row.imported_at), confidence: "low", reviewStatus: row.review_status as Lead["reviewStatus"], isMock: false, evidence: [{ sourceUrl, collectedAt: String(row.imported_at), criterion: "Campos website vazio e tel preenchido na exportação FSQ OS Places" }], criteria: ["coordenadas no distrito oficial de São Paulo", "country BR", "campo website vazio", "telefone informado na fonte", "sem sinal de fechamento ou flag crítica"], note: "O website não foi informado e o telefone consta na fonte. Confira manualmente se o negócio existe, se o número está atualizado e se já possui site.", ...shared };
   });
   const checkedAt = status?.checkedAt ?? lastUpdatedAt;
   const stale = checkedAt && Date.now() - new Date(checkedAt).getTime() > 36 * 60 * 60 * 1000;

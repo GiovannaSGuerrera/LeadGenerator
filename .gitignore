@@ -1,0 +1,11 @@
+node_modules/
+.next/
+.next-build/
+*.tsbuildinfo
+.env.local
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+tools/duckdb/*.exe
+tools/duckdb/*.zip
